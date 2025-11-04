@@ -1,0 +1,5 @@
+torch
+trl
+transformers
+peft
+bitsandbytes
