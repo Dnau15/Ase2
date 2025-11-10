@@ -1,289 +1,174 @@
-"""
-PPO training on CoderEval4Java.json using ONLY static metrics (no LLM judge).
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+)
+import torch
+from trl import GRPOConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig
+from trl import GRPOTrainer
 
-Usage:
-  python train_codereval_ppo_static.py \
-    --data_root /data_root/codereval_java \
-    --model Qwen2.5-Coder-7B-Instruct \
-    --out_dir ./runs/codereval_static \
-    --batch_size 32 --mini_batch_size 8 --ppo_epochs 3
 
-Deps:
-  pip install "transformers>=4.43" "accelerate>=0.30" peft bitsandbytes datasets trl==0.8.6
-"""
+PROMPT_TMPL = (
+    "You are a helpful Java coding assistant.\n"
+    "Task: {task}\n"
+    "Signature: {sig}\n"
+    "Return ONLY Java code.\n"
+)
 
-import os, re, json, argparse, torch
-from dataclasses import dataclass
-from typing import List, Optional, Dict
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model
-from trl import PPOConfig, PPOTrainer
-from datasets import Dataset
-# ----------------------------
-# Static metric utilities
-# ----------------------------
 
-DECISION_TOKENS = ("if", "for", "while", "case", "catch", "&&", "||", "?")
+def to_query(ex):
+    task = ex.get("human_label") or ex.get("docstring") or ""
+    sig = ex.get("name") or ""
+    return {"prompt": PROMPT_TMPL.format(task=task.strip(), sig=sig.strip())}
 
-def cyclomatic_complexity(code: str) -> int:
-    count = 1
-    for tok in DECISION_TOKENS:
-        count += len(re.findall(r"\b" + re.escape(tok) + r"\b", code))
-    return max(count, 1)
 
-def lines_of_code(code: str) -> int:
-    lines = [l for l in code.splitlines() if l.strip() and not l.strip().startswith("//")]
-    return len(lines)
+def cyclomatic_like(code: str) -> int:
+    return (
+        1
+        + sum((" if " in code,))
+        + code.count(" for(")
+        + code.count(" while(")
+        + code.count(" case ")
+        + code.count(" catch(")
+    )
 
-def max_nesting_depth(code: str) -> int:
-    depth, max_depth = 0, 0
-    tokens = re.findall(r"[{}]|\b(if|for|while|switch|try|catch)\b", code)
-    for t in tokens:
-        if t == "{":
-            depth += 1; max_depth = max(max_depth, depth)
-        elif t == "}":
-            depth -= 1
-    return max_depth
 
 def comment_ratio(code: str) -> float:
-    total = len(code.splitlines())
-    if total == 0: return 0.0
-    comment = sum(1 for l in code.splitlines()
-                  if l.strip().startswith("//") or "/*" in l or "*/" in l)
-    return min(max(comment / total, 0.0), 1.0)
+    lines = [l for l in code.splitlines() if l.strip()]
+    if not lines:
+        return 0.0
+    c = sum(
+        1
+        for l in lines
+        if l.strip().startswith("//") or "/*" in l or "*/" in l or l.strip() == "*"
+    )
+    return min(1.0, c / len(lines))
 
-def cbo_estimate(code: str) -> int:
-    # crude coupling proxy: distinct Type-like tokens
-    candidates = set(re.findall(r"\b([A-Z][A-Za-z0-9_]{2,})\b", code))
-    blacklist = {"Class","String","Integer","Long","Double","Boolean","List","Map","Set","System","Object"}
-    return max(len(candidates - blacklist), 0)
 
-def duplication_ratio(code: str, window: int = 6) -> float:
-    toks = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|[{}();,.=+\-*/<>!&|?:]", code)
-    if len(toks) < window*2: return 0.0
-    grams = {}
-    for i in range(len(toks)-window+1):
-        key = tuple(toks[i:i+window])
-        grams[key] = grams.get(key, 0)+1
-    dup_tokens = sum((c-1)*window for c in grams.values() if c>1)
-    return min(dup_tokens / max(len(toks),1), 1.0)
+def duplication_ratio(code: str, win=10) -> float:
+    toks = code.replace("\n", " ").split()
+    if len(toks) < 2 * win:
+        return 0.0
+    seen = {}
+    for i in range(len(toks) - win + 1):
+        k = tuple(toks[i : i + win])
+        seen[k] = seen.get(k, 0) + 1
+    dup = sum((v - 1) * win for v in seen.values() if v > 1)
+    return min(1.0, dup / max(1, len(toks)))
 
-def normalize(x, lo, hi, invert=False):
-    if hi <= lo: return 0.0
-    y = (x - lo) / (hi - lo)
-    y = min(max(y, 0.0), 1.0)
+
+def norm(x, lo, hi, invert=False):
+    y = (float(x) - lo) / max(1e-9, hi - lo)
+    y = max(0.0, min(1.0, y))
     return 1.0 - y if invert else y
 
-def metric_bundle(code: str) -> Dict[str, float]:
-    cc = cyclomatic_complexity(code)
-    loc = lines_of_code(code)
-    depth = max_nesting_depth(code)
-    comm = comment_ratio(code)
-    cbo = cbo_estimate(code)
-    dup = duplication_ratio(code)
 
-    # Empirical ranges (tune with dataset profiling if desired)
-    norm = {
-        "cc":       normalize(cc, 1, 20,  invert=True),
-        "loc":      normalize(loc, 5, 120, invert=True),
-        "depth":    normalize(depth, 1, 6, invert=True),
-        "comments": normalize(comm, 0.05, 0.35, invert=False),
-        "cbo":      normalize(cbo, 0, 25,  invert=True),
-        "dup":      normalize(dup, 0.0, 0.25, invert=True),
-    }
-    complexity  = (norm["cc"] + norm["depth"] + norm["loc"]) / 3.0
-    modularity  = (norm["cbo"] + norm["dup"]) / 2.0
-    readability = norm["comments"]
+def extract_java(text: str) -> str:
+    # strip everything up to instruction line
+    if "Return ONLY Java code." in text:
+        text = text.split("Return ONLY Java code.", 1)[-1].strip()
+    if "```java" in text:
+        return text.split("```java")[-1].split("```")[0].strip()
+    return text.strip()
 
-    return {
-        "cc_raw": cc, "loc_raw": loc, "depth_raw": depth,
-        "comm_raw": comm, "cbo_raw": cbo, "dup_raw": dup,
-        "complexity": complexity, "modularity": modularity, "readability": readability
-    }
 
-# The reward is only from static metrics (no correctness from a judge/tests here)
-def compute_reward(static_m: Dict[str, float],
-                   weights: Dict[str, float]) -> float:
-    R = (weights["complexity"]  * static_m["complexity"] +
-         weights["modularity"]  * static_m["modularity"] +
-         weights["readability"] * static_m["readability"])
-    return float(max(0.0, min(1.0, R)))
+def reward_fn(completions: list[list[dict[str, str]]], **kwargs) -> list[float]:
+    rewards = []
+    for t in completions:
+        code = extract_java(t)
+        cc = cyclomatic_like(" " + code.replace("\n", " ") + " ")
+        loc = len([l for l in code.splitlines() if l.strip()])
+        comm = comment_ratio(code)
+        dup = duplication_ratio(code)
 
-# ----------------------------
-# Data: CoderEval4Java.json
-# ----------------------------
-@dataclass
-class TaskItem:
-    id: str
-    prompt: str          # human_label or docstring
-    all_context: str
-    signature: str       # method/class name if present
-    code: str            # reference code (unused for training, handy for analysis)
-    docstring: str
-    human_label: str
-    context: Optional[str] = None
+        # normalize (tune ranges for your corpus if needed)
+        m_complex = (norm(cc, 1, 20, True) + norm(loc, 5, 120, True)) / 2.0
+        m_mod = norm(dup, 0.0, 0.15, True)
+        m_read = norm(comm, 0.00, 0.30, False)
 
-def load_codereval_records(data_root: str, limit: Optional[int]=None) -> List[TaskItem]:
-    path = os.path.join(data_root, "CoderEval4Java.json")
-    with open(path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    recs = raw.get("RECORDS", [])
-    tasks: List[TaskItem] = []
-    for r in recs:
-        tasks.append(TaskItem(
-            id=str(r.get("_id","")),
-            prompt=r.get("human_label", r.get("docstring","")),
-            all_context=r.get("all_context",""),
-            signature=r.get("name",""),
-            code=r.get("code",""),
-            docstring=r.get("docstring",""),
-            human_label=r.get("human_label",""),
-            context=r.get("file_content", None)
-        ))
-        if limit and len(tasks) >= limit:
-            break
-    return tasks
+        R = 0.4 * m_complex + 0.3 * m_mod + 0.3 * m_read  # [0..1]
+        rewards.append(float(R))
 
-def build_prompt(t: TaskItem) -> str:
-    parts = []
-    parts.append("You are a helpful Java coding assistant. Write clean, idiomatic Java.")
-    parts.append(f"Task:\n{t.prompt}")
-    if t.signature:
-        parts.append(f"Target method/class name:\n{t.signature}")
-    parts.append("Return ONLY the Java code. No explanations.")
-    return "\n\n".join(parts)
+    return rewards
 
-# ----------------------------
-# PPO trainer (QLoRA)
-# ----------------------------
+
+output_dir = "Qwen2.5-1.5B-Instruct-trl-grpo"
+
+# Configure training arguments using GRPOConfig
+training_args = GRPOConfig(
+    learning_rate=2e-5,
+    # num_train_epochs=1,
+    max_steps=100,  # Number of dataset passes. For full trainings, use `num_train_epochs` instead
+    # Parameters that control the data preprocessing
+    per_device_train_batch_size=2,
+    max_completion_length=1024,  # default: 256            # Max completion length produced during training
+    num_generations=2,  # 2, # default: 8                  # Number of generations produced during trainig for comparison
+    max_prompt_length=2048,  # default: 512                # Max prompt lenght of the input prompt used for generation during training
+    fp16=True,
+    # Parameters related to reporting and saving
+    output_dir=output_dir,  # Where to save model checkpoints and logs
+    logging_steps=1,  # Log training metrics every N steps
+    report_to="tensorboard",  # Experiment tracking tool
+)
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data_root", type=str, default="./data",
-                    help="Folder containing CoderEval4Java.json")
-    ap.add_argument("--model", type=str, default="Qwen/Qwen2.5-Coder-1.5B-Instruct")
-    ap.add_argument("--out_dir", type=str, default="./runs/codereval_static")
-    ap.add_argument("--limit", type=int, default=None)
+    data_path = "./data/CoderEval4Java.json"
+    model_name = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
 
-    # quant + LoRA
-    ap.add_argument("--load_in_4bit", action="store_true", default=True)
-    ap.add_argument("--r", type=int, default=16)
-    ap.add_argument("--lora_alpha", type=int, default=32)
-    ap.add_argument("--lora_dropout", type=float, default=0.05)
+    # Загружаем JSON
+    dataset = load_dataset("json", data_files=data_path, field="RECORDS")
 
-    # PPO
-    ap.add_argument("--learning_rate", type=float, default=1e-5)
-    ap.add_argument("--batch_size", type=int, default=32)
-    ap.add_argument("--mini_batch_size", type=int, default=8)
-    ap.add_argument("--ppo_epochs", type=int, default=3)
-    ap.add_argument("--clip_range", type=float, default=0.2)
-    ap.add_argument("--kl_target", type=float, default=0.08)
+    # Проверим структуру
+    print(dataset)
+    print(dataset["train"][0])
 
-    # generation
-    ap.add_argument("--gen_max_new_tokens", type=int, default=512)
-    ap.add_argument("--temperature", type=float, default=0.2)
-    ap.add_argument("--top_p", type=float, default=0.95)
+    dataset = dataset.map(to_query, remove_columns=dataset["train"].column_names)
 
-    # logging/checkpoints
-    ap.add_argument("--save_every", type=int, default=200)
-    ap.add_argument("--eval_every", type=int, default=500)
-
-    # reward weights (no correctness; only static metrics)
-    ap.add_argument("--w_complexity", type=float, default=0.40)
-    ap.add_argument("--w_modularity", type=float, default=0.35)
-    ap.add_argument("--w_readability", type=float, default=0.25)
-
-    args = ap.parse_args()
-    os.makedirs(args.out_dir, exist_ok=True)
-
-    # data
-    tasks = load_codereval_records("./data", args.limit)
-    prompts = [build_prompt(t) for t in tasks]
-    ds = Dataset.from_dict({"prompt": prompts})
-
-    # model
-    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    tok.pad_token = tok.eos_token
     model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        trust_remote_code=True,
-        device_map="auto",
-        torch_dtype=torch.float16,
-        load_in_4bit=args.load_in_4bit,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16
+        model_name, torch_dtype="auto", device_map="auto"
     )
-    lcfg = LoraConfig(
-        r=args.r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
-        target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
-        bias="none", task_type="CAUSAL_LM"
+
+    peft_config = LoraConfig(
+        r=8,
+        lora_alpha=32,
+        lora_dropout=0.1,
+        target_modules=["q_proj", "v_proj"],
     )
-    model = get_peft_model(model, lcfg)
 
-    # PPO
-    ppo_cfg = PPOConfig(
-        model_name=args.model,
-        learning_rate=args.learning_rate,
-        batch_size=args.batch_size,
-        mini_batch_size=args.mini_batch_size,
-        ppo_epochs=args.ppo_epochs,
-        clip_range=args.clip_range,
-        target_kl=args.kl_target,
-        remove_unused_columns=False
+    trainer = GRPOTrainer(
+        model=model,
+        reward_funcs=[reward_fn],
+        args=training_args,
+        train_dataset=dataset["train"],
+        peft_config=peft_config,
     )
-    trainer = PPOTrainer(ppo_cfg, model, tok)
 
-    gen_kwargs = dict(
-        max_new_tokens=args.gen_max_new_tokens,
-        do_sample=True,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        pad_token_id=tok.eos_token_id
+    gpu_stats = torch.cuda.get_device_properties(0)
+    start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+    max_memory = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
+
+    print(f"GPU = {gpu_stats.name}. Max memory = {max_memory} GB.")
+    print(f"{start_gpu_memory} GB of memory reserved.")
+
+    trainer_stats = trainer.train()
+
+    used_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+    used_memory_for_lora = round(used_memory - start_gpu_memory, 3)
+    used_percentage = round(used_memory / max_memory * 100, 3)
+    lora_percentage = round(used_memory_for_lora / max_memory * 100, 3)
+
+    print(f"{trainer_stats.metrics['train_runtime']} seconds used for training.")
+    print(
+        f"{round(trainer_stats.metrics['train_runtime'] / 60, 2)} minutes used for training."
     )
-    weights = {
-        "complexity":  args.w_complexity,
-        "modularity":  args.w_modularity,
-        "readability": args.w_readability,
-    }
+    print(f"Peak reserved memory = {used_memory} GB.")
+    print(f"Peak reserved memory for training = {used_memory_for_lora} GB.")
+    print(f"Peak reserved memory % of max memory = {used_percentage} %.")
+    print(f"Peak reserved memory for training % of max memory = {lora_percentage} %.")
 
-    # training loop
-    for start in range(0, len(ds), ppo_cfg.batch_size):
-        batch = ds[start:start+ppo_cfg.batch_size]
-        if len(batch["prompt"]) == 0:
-            break
-
-        # generate
-        input_ids = tok(batch["prompt"], return_tensors="pt", padding=True, truncation=True).to(model.device)
-        with torch.no_grad():
-            gen = model.generate(**input_ids, **gen_kwargs)
-
-        responses = tok.batch_decode(gen, skip_special_tokens=True)
-        # compute rewards from static metrics only
-        rewards = []
-        for resp in responses:
-            # try extracting fenced Java, else use full text
-            if "```java" in resp:
-                code = resp.split("```java")[-1].split("```")[0].strip()
-            else:
-                code = resp.strip()
-            static = metric_bundle(code)
-            R = compute_reward(static, weights)
-            rewards.append(R)
-
-        # PPO update
-        trainer.step(batch["prompt"], responses,
-                     torch.tensor(rewards, dtype=torch.float32, device=model.device))
-
-        step_idx = start // ppo_cfg.batch_size
-        if step_idx % max(1, args.save_every // max(1, ppo_cfg.batch_size)) == 0:
-            trainer.save_pretrained(os.path.join(args.out_dir, f"step_{start}"))
-        if step_idx % max(1, args.eval_every // max(1, ppo_cfg.batch_size)) == 0:
-            print(f"[eval] step={start} avgR={sum(rewards)/len(rewards):.3f}")
-
-    trainer.save_pretrained(os.path.join(args.out_dir, "final"))
-    print("Training complete:", args.out_dir)
 
 if __name__ == "__main__":
     main()
